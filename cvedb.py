@@ -209,6 +209,7 @@ class CVEDB(object):
         cve_data_create = """CREATE TABLE IF NOT EXISTS cve_released (
         cve_number TEXT,
         publish_date DATE,
+        score FLOAT,
         PRIMARY KEY(cve_number)
         )
         """
@@ -264,16 +265,12 @@ class CVEDB(object):
 
         cursor = self.connection.cursor()
 
-        query = """SELECT cve_number, publish_date FROM cve_released WHERE cve_number = ?"""
+        query = """SELECT cve_number, publish_date, score FROM cve_released WHERE cve_number = ?"""
         cvedict = dict()
         for cve_number in lcve_number:
             cursor.execute(query, [cve_number])
             for cve_res in cursor:
-                (
-                    cve_number,
-                    publish_date,
-                ) = cve_res
-                cvedict[cve_res[0]] = cve_res[1]
+                cvedict[cve_res[0]] = {"publishdate" : cve_res[1], "score": cve_res[2]}
 
         return cvedict
 
@@ -299,17 +296,48 @@ class CVEDB(object):
                 # the information we want:
                 # CVE ID, Severity, Score ->
                 # affected {Vendor(s), Product(s), Version(s)}
+                lcve = {
+                    "ID": cve_item["cve"]["CVE_data_meta"]["ID"],
+                    "description": cve_item["cve"]["description"]["description_data"][
+                        0
+                    ]["value"],
+                    "score": None,
+                    "CVSS_version": "unknown",
+                    "publishedDate": cve_item["publishedDate"]
+                }
+
                 CVE = dict()
-                CVE["ID"] = cve_item["cve"]["CVE_data_meta"]["ID"]
-                CVE["publishedDate"] = parser.isoparse(cve_item["publishedDate"])
+                CVE["ID"] = lcve["ID"]
+                CVE["publishedDate"] = parser.isoparse(lcve["publishedDate"])
 
-                #CVE["publishedDate"] = datetime.datetime.fromisoformat(cve_item["publishedDate"])
-                    #strptime("%Y-%m-%dT%H:%M", cve_item["publishedDate"])
 
-                q = "INSERT or REPLACE INTO cve_released(CVE_number, publish_date) \
-                VALUES (?, ?)"
+                # Get CVSSv3 or CVSSv2 score for output.
+                # Details are left as an exercise to the user.
+                if "baseMetricV3" in cve_item["impact"]:
+                    lcve["severity"] = cve_item["impact"]["baseMetricV3"]["cvssV3"][
+                        "baseSeverity"
+                    ]
+                    lcve["score"] = cve_item["impact"]["baseMetricV3"]["cvssV3"][
+                        "baseScore"
+                    ]
+                    lcve["CVSS_version"] = 3
+                elif "baseMetricV2" in cve_item["impact"]:
+                    lcve["severity"] = cve_item["impact"]["baseMetricV2"]["severity"]
+                    lcve["score"] = cve_item["impact"]["baseMetricV2"]["cvssV2"][
+                        "baseScore"
+                    ]
+                    lcve["CVSS_version"] = 2
+
+                CVE["score"] = lcve["score"]
+
+                q = "INSERT or REPLACE INTO cve_released(CVE_number, publish_date, score) VALUES (?, ?, ?)"
                 cursor.execute(
-                    q, [CVE["ID"], CVE["publishedDate"]]
+                    q,
+                    [
+                        CVE["ID"],
+                        CVE["publishedDate"],
+                        CVE["score"],
+                    ],
                 )
 
             self.connection.commit()
