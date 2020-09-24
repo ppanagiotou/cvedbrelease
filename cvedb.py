@@ -163,7 +163,7 @@ class CVEDB(object):
     CACHEDIR = os.path.join(os.path.expanduser("~"), ".cache", "cvedbrelease")
     FEED = "https://nvd.nist.gov/vuln/data-feeds"
     NVDCVE_FILENAME_TEMPLATE = "nvdcve-1.1-{}.json"
-    META_REGEX = re.compile(r"https:\/\/.*\/json\/.*-[0-9]*\.[0-9]*-[0-9]*\.meta")
+    META_REGEX = re.compile(r"\/feeds/json\/.*-[0-9]*\.[0-9]*-[0-9]*\.meta")
     RANGE_UNSET = ""
     LOGGER = LOGGER
 
@@ -186,7 +186,7 @@ class CVEDB(object):
     def nist_scrape(self, feed):
         with contextlib.closing(request.urlopen(feed)) as response:
             page = response.read().decode()
-            jsonmetalinks = self.META_REGEX.findall(page)
+            jsonmetalinks = ["https://nvd.nist.gov" + i for i in self.META_REGEX.findall(page)]
             pool = multiprocessing.Pool()
             try:
                 metadata = dict(
