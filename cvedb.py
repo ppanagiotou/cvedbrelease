@@ -285,7 +285,7 @@ class CVEDB:
             description TEXT,
             score INTEGER,
             cvss_version INTEGER,
-            publish_date DATE,
+            publishdate DATE,
             PRIMARY KEY(cve_number)
         )
         """
@@ -332,7 +332,7 @@ class CVEDB:
             description,
             score,
             cvss_version,
-            publish_date
+            publishdate
         )
         VALUES (?, ?, ?, ?, ?, ?)
         """
@@ -606,7 +606,7 @@ class CVEDB:
 
         cursor = self.connection.cursor()
 
-        query = """SELECT cve_number, publish_date, score, cvss_version FROM cve_severity WHERE cve_number = ?"""
+        query = """SELECT cve_number, publishdate, score, cvss_version FROM cve_severity WHERE cve_number = ?"""
         cvedict = dict()
         for cve_number in lcve_number:
             cursor.execute(query, [cve_number])
