@@ -602,8 +602,7 @@ class CVEDB:
 
     def get_cves(self, lcve_number):
 
-        if self.connection is None:
-            self.open()
+        self.db_open()
 
         cursor = self.connection.cursor()
 
