@@ -4,6 +4,7 @@ Getting only released date
 Similarly and based on: https://github.com/intel/cve-bin-tool/blob/master/cve_bin_tool/cvedb.py
 """
 import argparse
+from dateutil import parser
 import sys
 
 """
@@ -373,7 +374,7 @@ class CVEDB:
                     "severity": "unknown",
                     "score": "unknown",
                     "CVSS_version": "unknown",
-                    "publishedDate": cve_item["publishedDate"]
+                    "publishedDate": parser.isoparse(cve_item["publishedDate"])
                 }
                 # Get CVSSv3 or CVSSv2 score for output.
                 # Details are left as an exercise to the user.
