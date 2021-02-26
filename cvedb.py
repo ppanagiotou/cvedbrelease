@@ -4,6 +4,9 @@ Getting only released date
 Similarly and based on: https://github.com/intel/cve-bin-tool/blob/master/cve_bin_tool/cvedb.py
 """
 import argparse
+from pathlib import Path
+from time import sleep
+
 from dateutil import parser
 import sys
 
@@ -139,9 +142,25 @@ class CVEDB:
                 self.LOGGER.debug(f"Correct SHA for {filename}")
                 return
         self.LOGGER.debug(f"Updating CVE cache for {filename}")
+
+        # limit concurent request time
+        sleep(1)
+        print((str(url)))
         async with session.get(url) as response:
             gzip_data = await response.read()
-            json_data = gzip.decompress(gzip_data)
+            try:
+                json_data = gzip.decompress(gzip_data)
+            except:
+                sleep(1)
+                print("wget:", str(response.url))
+                import wget
+                wgetfilepath = str(Path(filepath).parent)
+                filename = wget.download(str(response.url), out=wgetfilepath)
+                fp = open(filename, "rb")
+                gzip_data = fp.read()
+                fp.close()
+                json_data = gzip.decompress(gzip_data)
+
             gotsha = hashlib.sha256(json_data).hexdigest().upper()
             async with FileIO(filepath, "wb") as filepath_handle:
                 await filepath_handle.write(gzip_data)
