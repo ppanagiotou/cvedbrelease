@@ -151,7 +151,7 @@ class CVEDB:
             try:
                 json_data = gzip.decompress(gzip_data)
             except:
-                sleep(1)
+                sleep(5)
                 print("wget:", str(response.url))
                 import wget
                 wgetfilepath = str(Path(filepath).parent)
