@@ -144,7 +144,7 @@ class CVEDB:
         self.LOGGER.debug(f"Updating CVE cache for {filename}")
 
         # limit concurent request time
-        sleep(1)
+        sleep(2)
         print((str(url)))
         async with session.get(url) as response:
             gzip_data = await response.read()
