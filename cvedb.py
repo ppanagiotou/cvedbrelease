@@ -43,6 +43,8 @@ from cve_bin_tool.version import check_latest_version
 
 logging.basicConfig(level=logging.DEBUG)
 
+semaphore = asyncio.Semaphore(3)
+
 # database defaults
 DISK_LOCATION_DEFAULT = os.path.join(os.path.expanduser("~"), ".cache", "cvedbrelease")
 DBNAME = "cve.db"
@@ -144,26 +146,27 @@ class CVEDB:
         self.LOGGER.debug(f"Updating CVE cache for {filename}")
 
         # limit concurent request time
-        sleep(2)
-        print((str(url)))
-        async with session.get(url) as response:
-            gzip_data = await response.read()
-            try:
-                json_data = gzip.decompress(gzip_data)
-            except:
-                sleep(5)
-                print("wget:", str(response.url))
-                import wget
-                wgetfilepath = str(Path(filepath).parent)
-                filename = wget.download(str(response.url), out=wgetfilepath)
-                fp = open(filename, "rb")
-                gzip_data = fp.read()
-                fp.close()
-                json_data = gzip.decompress(gzip_data)
+        async with semaphore:
+            print((str(url)))
+            async with session.get(url) as response:
+                gzip_data = await response.read()
+                try:
+                    json_data = gzip.decompress(gzip_data)
+                except:
+                    # delay 1 sec
+                    sleep(1)
+                    print("wget:", str(response.url))
+                    import wget
+                    wgetfilepath = str(Path(filepath).parent)
+                    filename = wget.download(str(response.url), out=wgetfilepath)
+                    fp = open(filename, "rb")
+                    gzip_data = fp.read()
+                    fp.close()
+                    json_data = gzip.decompress(gzip_data)
 
-            gotsha = hashlib.sha256(json_data).hexdigest().upper()
-            async with FileIO(filepath, "wb") as filepath_handle:
-                await filepath_handle.write(gzip_data)
+                gotsha = hashlib.sha256(json_data).hexdigest().upper()
+                async with FileIO(filepath, "wb") as filepath_handle:
+                    await filepath_handle.write(gzip_data)
         # Raise error if there was an issue with the sha
         if gotsha != sha:
             # Remove the file if there was an issue
