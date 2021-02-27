@@ -4,6 +4,7 @@ Getting only released date
 Similarly and based on: https://github.com/intel/cve-bin-tool/blob/master/cve_bin_tool/cvedb.py
 """
 import argparse
+import subprocess
 from pathlib import Path
 from time import sleep
 
@@ -153,12 +154,11 @@ class CVEDB:
                 try:
                     json_data = gzip.decompress(gzip_data)
                 except:
-                    # delay 1 sec
-                    sleep(1)
                     print("wget:", str(response.url))
-                    import wget
+                    sleep(1)
                     wgetfilepath = str(Path(filepath).parent)
-                    filename = wget.download(str(response.url), out=wgetfilepath)
+                    filename = filepath
+                    subprocess.run(["wget", "-P", wgetfilepath, str(url)])
                     fp = open(filename, "rb")
                     gzip_data = fp.read()
                     fp.close()
