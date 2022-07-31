@@ -1,82 +1,73 @@
-"""
-Retrieval access and caching of NIST CVE database
-Getting only released date
-Similarly and based on: https://github.com/intel/cve-bin-tool/blob/master/cve_bin_tool/cvedb.py
-"""
-import argparse
-import subprocess
-from pathlib import Path
-from time import sleep
+# Copyright (C) 2022 Intel Corporation
+# SPDX-License-Identifier: GPL-3.0-or-later
 
-from dateutil import parser
+"""
+Handling CVE database
+"""
+from __future__ import annotations
+
+import argparse
+
 import sys
 
-"""
-Retrieval access and caching of NIST CVE database
-"""
 import asyncio
 import datetime
-import glob
-import gzip
-import hashlib
-import json
 import logging
-import os
-import re
 import shutil
 import sqlite3
+from pathlib import Path
+from typing import Any
+import json
 
-import aiohttp
-from bs4 import BeautifulSoup
+import requests
 from rich.progress import track
 
-from cve_bin_tool.async_utils import FileIO, GzipFile, run_coroutine
-from cve_bin_tool.error_handler import (
-    AttemptedToWriteOutsideCachedir,
-    SHAMismatch,
-    CVEDataForYearNotInCache,
-    CVEDataForCurlVersionNotInCache,
-    ErrorHandler,
-    ErrorMode,
-)
+from cve_bin_tool.async_utils import run_coroutine
+from data_sources import curl_source, nvd_source, osv_source
+from cve_bin_tool.error_handler import ErrorMode
 from cve_bin_tool.log import LOGGER
 from cve_bin_tool.version import check_latest_version
 
 logging.basicConfig(level=logging.DEBUG)
 
-semaphore = asyncio.Semaphore(3)
-
 # database defaults
-DISK_LOCATION_DEFAULT = os.path.join(os.path.expanduser("~"), ".cache", "cvedbrelease")
+DISK_LOCATION_DEFAULT = Path("~").expanduser() / ".cache" / "cvedbrelease"
+DISK_LOCATION_BACKUP = Path("~").expanduser() / ".cache" / "cvedbrelease-backup"
 DBNAME = "cve.db"
-OLD_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "cvedbold")
-
+OLD_CACHE_DIR = Path("~") / ".cache" / "cvedb"
 
 class CVEDB:
     """
-    Downloads NVD data in json form and stores it on disk in a cache.
+    Retrieves CVE data from data sources and handles CVE Database.
+    The sources can be found in the cve_bin_tool/data_sources/ directory.
     """
 
     CACHEDIR = DISK_LOCATION_DEFAULT
-    FEED = "https://nvd.nist.gov/vuln/data-feeds"
-    LOGGER = LOGGER.getChild("CVEDB")
-    NVDCVE_FILENAME_TEMPLATE = "nvdcve-1.1-{}.json.gz"
-    CURL_CVE_FILENAME_TEMPLATE = "curlcve-{}.json"
-    META_LINK = "https://nvd.nist.gov"
-    META_REGEX = re.compile(r"\/feeds\/json\/.*-[0-9]*\.[0-9]*-[0-9]*\.meta")
-    RANGE_UNSET = ""
+    BACKUPCACHEDIR = DISK_LOCATION_BACKUP
+    LOGGER = logging.getLogger("cvedb")
+    SOURCES = [nvd_source.NVD_Source, curl_source.Curl_Source, osv_source.OSV_Source]
 
     def __init__(
         self,
-        feed=None,
-        cachedir=None,
-        version_check=True,
-        session=None,
-        error_mode=ErrorMode.TruncTrace,
+        sources=None,
+        cachedir: str | None = None,
+        backup_cachedir: str | None = None,
+        version_check: bool = True,
+        error_mode: ErrorMode = ErrorMode.TruncTrace,
     ):
-        self.feed = feed if feed is not None else self.FEED
-        self.cachedir = cachedir if cachedir is not None else self.CACHEDIR
+        self.sources = (
+            sources
+            if sources is not None
+            else [x(error_mode=error_mode) for x in self.SOURCES]
+        )
+        self.cachedir = Path(cachedir) if cachedir is not None else self.CACHEDIR
+        self.backup_cachedir = (
+            Path(backup_cachedir)
+            if backup_cachedir is not None
+            else self.BACKUPCACHEDIR
+        )
         self.error_mode = error_mode
+
         # Will be true if refresh was successful
         self.was_updated = False
 
@@ -84,186 +75,49 @@ class CVEDB:
         self.version_check = version_check
 
         # set up the db if needed
-        self.dbpath = os.path.join(self.cachedir, DBNAME)
-        self.connection = None
-        self.session = session
+        self.dbpath = self.cachedir / DBNAME
+        self.connection: sqlite3.Connection | None = None
 
-    async def getmeta(self, session, meta_url):
-        async with session.get(meta_url) as response:
-            return (
-                meta_url.replace(".meta", ".json.gz"),
-                dict(
-                    [
-                        line.split(":", maxsplit=1)
-                        for line in (await response.text()).splitlines()
-                        if ":" in line
-                    ]
-                ),
-            )
+        self.data = []
+        self.cve_count = -1
+        self.all_cve_entries: list[dict[str, Any]] | None = None
 
-    async def nist_scrape(self, session):
-        async with session.get(self.feed) as response:
-            page = await response.text()
-            json_meta_links = self.META_REGEX.findall(page)
-            return dict(
-                await asyncio.gather(
-                    *[
-                        self.getmeta(session, f"{self.META_LINK}{meta_url}")
-                        for meta_url in json_meta_links
-                    ]
-                )
-            )
+        self.exploits_list = []
+        self.exploit_count = 0
 
-    async def cache_update(self, session, url, sha, chunk_size=16 * 1024):
-        """
-        Update the cache for a single year of NVD data.
-        """
-        filename = url.split("/")[-1]
-        # Ensure we only write to files within the cachedir
-        filepath = os.path.abspath(os.path.join(self.cachedir, filename))
-        if not filepath.startswith(os.path.abspath(self.cachedir)):
-            with ErrorHandler(mode=self.error_mode, logger=self.LOGGER):
-                raise AttemptedToWriteOutsideCachedir(filepath)
-        # Validate the contents of the cached file
-        if os.path.isfile(filepath):
-            # Validate the sha and write out
-            sha = sha.upper()
-            calculate = hashlib.sha256()
-            async with GzipFile(filepath, "rb") as f:
-                chunk = await f.read(chunk_size)
-                while chunk:
-                    calculate.update(chunk)
-                    chunk = await f.read(chunk_size)
-            # Validate the sha and exit if it is correct, otherwise update
-            gotsha = calculate.hexdigest().upper()
-            if gotsha != sha:
-                os.unlink(filepath)
-                self.LOGGER.warning(
-                    f"SHA mismatch for {filename} (have: {gotsha}, want: {sha})"
-                )
-            else:
-                self.LOGGER.debug(f"Correct SHA for {filename}")
-                return
-        self.LOGGER.debug(f"Updating CVE cache for {filename}")
+        if not self.dbpath.exists():
+            self.rollback_cache_backup()
 
-        # limit concurent request time
-        async with semaphore:
-            print((str(url)))
-            async with session.get(url) as response:
-                gzip_data = await response.read()
-                try:
-                    json_data = gzip.decompress(gzip_data)
-                except:
-                    print("wget:", str(response.url))
-                    sleep(1)
-                    wgetfilepath = str(Path(filepath).parent)
-                    filename = filepath
-                    subprocess.run(["wget", "-P", wgetfilepath, str(url)])
-                    fp = open(filename, "rb")
-                    gzip_data = fp.read()
-                    fp.close()
-                    json_data = gzip.decompress(gzip_data)
+    def get_cve_count(self) -> int:
+        if self.cve_count == -1:
+            # Force update
+            self.check_cve_entries()
+        return self.cve_count
 
-                gotsha = hashlib.sha256(json_data).hexdigest().upper()
-                async with FileIO(filepath, "wb") as filepath_handle:
-                    await filepath_handle.write(gzip_data)
-        # Raise error if there was an issue with the sha
-        if gotsha != sha:
-            # Remove the file if there was an issue
-            # exit(100)
-            os.unlink(filepath)
-            with ErrorHandler(mode=self.error_mode, logger=self.LOGGER):
-                raise SHAMismatch(f"{url} (have: {gotsha}, want: {sha})")
+    def check_db_exists(self) -> bool:
+        return self.dbpath.is_file()
 
-    @staticmethod
-    async def get_curl_versions(session):
-        regex = re.compile(r"vuln-(\d+.\d+.\d+)\.html")
-        async with session.get(
-            "https://curl.haxx.se/docs/vulnerabilities.html"
-        ) as response:
-            html = await response.text()
-        matches = regex.finditer(html)
-        return [match.group(1) for match in matches]
-
-    async def download_curl_version(self, session, version):
-        async with session.get(
-            f"https://curl.haxx.se/docs/vuln-{version}.html"
-        ) as response:
-            html = await response.text()
-        soup = BeautifulSoup(html, "html.parser")
-        table = soup.find("table")
-        if not table:
-            return
-        headers = table.find_all("th")
-        headers = list(map(lambda x: x.text.strip().lower(), headers))
-        self.LOGGER.debug(headers)
-        rows = table.find_all("tr")
-        json_data = []
-        for row in rows:
-            cols = row.find_all("td")
-            values = (ele.text.strip() for ele in cols)
-            data = dict(zip(headers, values))
-            if data:
-                json_data.append(data)
-        filepath = os.path.abspath(
-            os.path.join(self.cachedir, f"curlcve-{version}.json")
+    def get_db_update_date(self) -> float:
+        # last time when CVE data was updated
+        self.time_of_last_update = datetime.datetime.fromtimestamp(
+            self.dbpath.stat().st_mtime
         )
-        async with FileIO(filepath, "w") as f:
-            await f.write(json.dumps(json_data, indent=4))
+        return self.dbpath.stat().st_mtime
 
-    async def refresh(self):
-        """ Refresh the cve database and check for new version. """
+    async def refresh(self) -> None:
+        """Refresh the cve database and check for new version."""
         # refresh the database
-        if not os.path.isdir(self.cachedir):
-            os.makedirs(self.cachedir)
+        if not self.cachedir.is_dir():
+            self.cachedir.mkdir(parents=True)
+
         # check for the latest version
         if self.version_check:
-            self.LOGGER.info("Checking if there is a newer version.")
             check_latest_version()
-        if not self.session:
-            self.session = aiohttp.ClientSession()
-        self.LOGGER.info("Downloading CVE data...")
-        nvd_metadata, curl_metadata = await asyncio.gather(
-            self.nist_scrape(self.session), self.get_curl_versions(self.session)
-        )
-        tasks = [
-            self.cache_update(self.session, url, meta["sha256"])
-            for url, meta in nvd_metadata.items()
-            if meta is not None
-        ]
-        # We use gather to create a single task from a set of tasks
-        # which download CVEs for each version of curl. Otherwise
-        # the progress bar would show that we are closer to
-        # completion than we think, because lots of curl CVEs (for
-        # each version) have been downloaded
-        tasks.append(
-            asyncio.gather(
-                *[
-                    self.download_curl_version(self.session, version)
-                    for version in curl_metadata
-                ]
-            )
-        )
-        total_tasks = len(tasks)
 
-        # error_mode.value will only be greater than 1 if quiet mode.
-        if self.error_mode.value > 1:
-            iter_tasks = track(
-                asyncio.as_completed(tasks),
-                description="Downloading CVEs...",
-                total=total_tasks,
-            )
-        else:
-            iter_tasks = asyncio.as_completed(tasks)
+        await self.get_data()
 
-        for task in iter_tasks:
-            await task
-        self.was_updated = True
-        await self.session.close()
-        self.session = None
-
-    def refresh_cache_and_update_db(self):
-        self.LOGGER.info("Updating CVE data. This will take a few minutes.")
+    def refresh_cache_and_update_db(self) -> None:
+        self.LOGGER.debug("Updating CVE data. This will take a few minutes.")
         # refresh the nvd cache
         run_coroutine(self.refresh())
 
@@ -271,36 +125,71 @@ class CVEDB:
         self.init_database()
         self.populate_db()
 
-    def get_cvelist_if_stale(self):
+    def get_cvelist_if_stale(self) -> None:
         """Update if the local db is more than one day old.
         This avoids the full slow update with every execution.
         """
-        if not os.path.isfile(self.dbpath) or (
+        if not self.dbpath.is_file() or (
             datetime.datetime.today()
-            - datetime.datetime.fromtimestamp(os.path.getmtime(self.dbpath))
+            - datetime.datetime.fromtimestamp(self.dbpath.stat().st_mtime)
         ) > datetime.timedelta(hours=24):
             self.refresh_cache_and_update_db()
+            self.time_of_last_update = datetime.datetime.today()
         else:
+            self.time_of_last_update = datetime.datetime.fromtimestamp(
+                self.dbpath.stat().st_mtime
+            )
             self.LOGGER.info(
                 "Using cached CVE data (<24h old). Use -u now to update immediately."
             )
+            self.db_open()
+            if not self.latest_schema(self.connection.cursor()):
+                self.refresh_cache_and_update_db()
+                self.time_of_last_update = datetime.datetime.today()
+            else:
+                self.db_close()
 
-    def latest_schema(self, cursor):
-        """ Check database is using latest schema """
-        self.LOGGER.info("Check database is using latest schema")
+    def latest_schema(self, cursor: sqlite3.Cursor) -> bool:
+        """Check database is using latest schema"""
+        self.LOGGER.debug("Check database is using latest schema")
         schema_check = "SELECT * FROM cve_severity WHERE 1=0"
         result = cursor.execute(schema_check)
         schema_latest = False
         # Look through column names and check for column added in latest schema
         for col_name in result.description:
-            if col_name[0] == "description":
+            if col_name[0] == "data_source":
                 schema_latest = True
         return schema_latest
 
-    def init_database(self):
-        """ Initialize db tables used for storing cve/version data """
+    def check_cve_entries(self) -> bool:
+        """Report if database has some CVE entries"""
         self.db_open()
         cursor = self.connection.cursor()
+        cve_entries_check = "SELECT COUNT(*) FROM cve_severity"
+        cursor.execute(cve_entries_check)
+        # Find number of entries
+        cve_entries = cursor.fetchone()[0]
+        self.LOGGER.info(f"There are {cve_entries} CVE entries in the database")
+        self.db_close()
+        self.cve_count = cve_entries
+        return cve_entries > 0
+
+    async def get_data(self):
+        """Get CVE data from datasources"""
+        tasks = []
+
+        for source in self.sources:
+            if source is not None:
+                tasks.append(source.get_cve_data())
+
+        for r in await asyncio.gather(*tasks):
+            self.data.append(r)
+
+    def init_database(self) -> None:
+        """Initialize db tables used for storing cve/version data"""
+        self.db_open()
+        cursor = self.connection.cursor()
+
         cve_data_create = """
         CREATE TABLE IF NOT EXISTS cve_severity (
             cve_number TEXT,
@@ -308,6 +197,8 @@ class CVEDB:
             description TEXT,
             score INTEGER,
             cvss_version INTEGER,
+            cvss_vector TEXT,
+            data_source TEXT,
             publishdate DATE,
             PRIMARY KEY(cve_number)
         )
@@ -321,7 +212,8 @@ class CVEDB:
             versionStartIncluding TEXT,
             versionStartExcluding TEXT,
             versionEndIncluding TEXT,
-            versionEndExcluding TEXT
+            versionEndExcluding TEXT,
+            FOREIGN KEY(cve_number) REFERENCES cve_severity(cve_number)
         )
         """
         index_range = "CREATE INDEX IF NOT EXISTS product_index ON cve_range (cve_number, vendor, product)"
@@ -329,184 +221,91 @@ class CVEDB:
         cursor.execute(version_range_create)
         cursor.execute(index_range)
 
-        # Check that latest schema is being used
         if not self.latest_schema(cursor):
             # Recreate table using latest schema
             self.LOGGER.info("Upgrading database to latest schema")
             cursor.execute("DROP TABLE cve_severity")
             cursor.execute(cve_data_create)
-            self.clear_cached_data()
         self.connection.commit()
 
-    def populate_db(self):
-        """Function that populates the database from the JSON.
+        self.db_close()
 
+    def populate_db(self) -> None:
+        """Function that populates the database from the JSON.
         WARNING: After some inspection of the data, we are assuming that start/end ranges are kept together
         in single nodes.  This isn't *required* by the json so may not be true everywhere.  If that's the case,
         we'll need a better parser to match those together.
         """
-        self.db_open()
-        cursor = self.connection.cursor()
 
-        insert_severity = """
-        INSERT or REPLACE INTO cve_severity(
+        for idx, data in enumerate(self.data):
+            _, source_name = data
+
+            if source_name == "NVD":
+                self.data.insert(0, self.data.pop(idx))
+                break
+
+        for cve_data, source_name in self.data:
+
+            if source_name != "NVD" and cve_data[0] is not None:
+                cve_data = self.update_vendors(cve_data)
+                cve_data = self.filter_duplicate(cve_data, source_name)
+
+            severity_data, affected_data = cve_data
+
+            self.db_open()
+            cursor = self.connection.cursor()
+
+            if severity_data is not None:
+                self.populate_severity(severity_data, cursor, data_source=source_name)
+            if affected_data is not None:
+                self.populate_affected(
+                    affected_data,
+                    cursor,
+                )
+
+            self.connection.commit()
+            self.db_close()
+
+    def populate_severity(self, severity_data, cursor, data_source):
+        cve_severity = """
+        cve_severity(
             CVE_number,
             severity,
             description,
             score,
             cvss_version,
+            cvss_vector,
+            data_source,
             publishdate
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """
-        insert_cve_range = """
-        INSERT or REPLACE INTO cve_range(
-            cve_number,
-            vendor,
-            product,
-            version,
-            versionStartIncluding,
-            versionStartExcluding,
-            versionEndIncluding,
-            versionEndExcluding
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """
+
+        insert_severity = f"INSERT or REPLACE INTO {cve_severity}"
         del_cve_range = "DELETE from cve_range where CVE_number=?"
 
-        # error_mode.value will only be greater than 1 if quiet mode.
-        if self.error_mode.value > 1:
-            years = track(self.nvd_years(), description="Updating CVEs from NVD...")
-        else:
-            years = self.nvd_years()
-
-        for year in years:
-            cve_data = self.load_nvd_year(year)
-            self.LOGGER.debug(
-                f'Time = {datetime.datetime.today().strftime("%H:%M:%S")}'
-            )
-            for cve_item in cve_data["CVE_Items"]:
-                # the information we want:
-                # CVE ID, Severity, Score ->
-                # affected {Vendor(s), Product(s), Version(s)}
-                cve = {
-                    "ID": cve_item["cve"]["CVE_data_meta"]["ID"],
-                    "description": cve_item["cve"]["description"]["description_data"][
-                        0
-                    ]["value"],
-                    "severity": "unknown",
-                    "score": "unknown",
-                    "CVSS_version": "unknown",
-                    "publishedDate": parser.isoparse(cve_item["publishedDate"])
-                }
-                # Get CVSSv3 or CVSSv2 score for output.
-                # Details are left as an exercise to the user.
-                if "baseMetricV3" in cve_item["impact"]:
-                    cve["severity"] = cve_item["impact"]["baseMetricV3"]["cvssV3"][
-                        "baseSeverity"
-                    ]
-                    cve["score"] = cve_item["impact"]["baseMetricV3"]["cvssV3"][
-                        "baseScore"
-                    ]
-                    cve["CVSS_version"] = 3
-                elif "baseMetricV2" in cve_item["impact"]:
-                    cve["severity"] = cve_item["impact"]["baseMetricV2"]["severity"]
-                    cve["score"] = cve_item["impact"]["baseMetricV2"]["cvssV2"][
-                        "baseScore"
-                    ]
-                    cve["CVSS_version"] = 2
-
-                # self.LOGGER.debug(
-                #    "Severity: {} ({}) v{}".format(
-                #        CVE["severity"], CVE["score"], CVE["CVSS_version"]
-                #    )
-                # )
-
-                cursor.execute(
-                    insert_severity,
-                    [
-                        cve["ID"],
-                        cve["severity"],
-                        cve["description"],
-                        cve["score"],
-                        cve["CVSS_version"],
-                        cve["publishedDate"],
-                    ],
+        cursor.executemany(
+            insert_severity,
+            [
+                (
+                    cve["ID"],
+                    cve["severity"],
+                    cve["description"],
+                    cve["score"],
+                    cve["CVSS_version"],
+                    cve["CVSS_vector"],
+                    data_source,
+                    cve["publishedDate"],
                 )
+                for cve in severity_data
+            ],
+        )
 
-                # Delete any old range entries for this CVE_number
-                cursor.execute(del_cve_range, (cve["ID"],))
+        # Delete any old range entries for this CVE_number
+        cursor.executemany(del_cve_range, [(cve["ID"],) for cve in severity_data])
 
-                # walk the nodes with version data
-                # return list of versions
-                affects_list = []
-                if "configurations" in cve_item:
-                    for node in cve_item["configurations"]["nodes"]:
-                        # self.LOGGER.debug("NODE: {}".format(node))
-                        affects_list.extend(self.parse_node(node))
-                        if "children" in node:
-                            for child in node["children"]:
-                                affects_list.extend(self.parse_node(child))
-                # self.LOGGER.debug("Affects: {}".format(affects_list))
-                cursor.executemany(
-                    insert_cve_range,
-                    [
-                        (
-                            cve["ID"],
-                            affected["vendor"],
-                            affected["product"],
-                            affected["version"],
-                            affected["versionStartIncluding"],
-                            affected["versionStartExcluding"],
-                            affected["versionEndIncluding"],
-                            affected["versionEndExcluding"],
-                        )
-                        for affected in affects_list
-                    ],
-                )
-            self.connection.commit()
+    def populate_affected(self, affected_data, cursor):
 
-        # supplemental data gets added here
-        self.supplement_curl()
-        self.db_close()
-
-    def parse_node(self, node):
-        affects_list = []
-        if "cpe_match" in node:
-            for cpe_match in node["cpe_match"]:
-                # self.LOGGER.debug(cpe_match["cpe23Uri"])
-                cpe_split = cpe_match["cpe23Uri"].split(":")
-                affects = {
-                    "vendor": cpe_split[3],
-                    "product": cpe_split[4],
-                    "version": cpe_split[5],
-                }
-
-                # self.LOGGER.debug(
-                #    "Vendor: {} Product: {} Version: {}".format(
-                #        affects["vendor"], affects["product"], affects["version"]
-                #    )
-                # )
-                # if we have a range (e.g. version is *) fill it out, and put blanks where needed
-                range_fields = [
-                    "versionStartIncluding",
-                    "versionStartExcluding",
-                    "versionEndIncluding",
-                    "versionEndExcluding",
-                ]
-                for field in range_fields:
-                    if field in cpe_match:
-                        affects[field] = cpe_match[field]
-                    else:
-                        affects[field] = self.RANGE_UNSET
-
-                affects_list.append(affects)
-        return affects_list
-
-    def supplement_curl(self):
-        """
-        Get additional CVE data directly from the curl website amd add it to the cvedb
-        """
-        self.db_open()
         insert_cve_range = """
         INSERT or REPLACE INTO cve_range(
             cve_number,
@@ -519,109 +318,267 @@ class CVEDB:
             versionEndExcluding
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """
-        cursor = self.connection.cursor()
-        # No need to track this. It is very fast!
-        for version in self.curl_versions():
-            cve_list = self.load_curl_version(version)
-            # for cve in cve_list:
-            cursor.executemany(
-                insert_cve_range,
-                [
-                    (
-                        cve["cve"],
-                        "haxx",
-                        "curl",
-                        version,
-                        cve["from version"],
-                        "",
-                        cve["to and including"],
-                        "",
-                    )
-                    for cve in cve_list
-                ],
-            )
-            self.connection.commit()
 
-    def load_nvd_year(self, year):
-        """
-        Return the dict of CVE data for the given year.
-        """
-        filename = os.path.join(
-            self.cachedir, self.NVDCVE_FILENAME_TEMPLATE.format(year)
-        )
-        # Check if file exists
-        if not os.path.isfile(filename):
-            with ErrorHandler(mode=self.error_mode, logger=self.LOGGER):
-                raise CVEDataForYearNotInCache(year)
-        # Open the file and load the JSON data, log the number of CVEs loaded
-        with gzip.open(filename, "rb") as fileobj:
-            cves_for_year = json.load(fileobj)
-            self.LOGGER.debug(
-                f'Year {year} has {len(cves_for_year["CVE_Items"])} CVEs in dataset'
-            )
-            return cves_for_year
-
-    def nvd_years(self):
-        """
-        Return the years we have NVD data for.
-        """
-        return sorted(
+        cursor.executemany(
+            insert_cve_range,
             [
-                int(filename.split(".")[-3].split("-")[-1])
-                for filename in glob.glob(
-                    os.path.join(self.cachedir, "nvdcve-1.1-*.json.gz")
+                (
+                    affected["cve_id"],
+                    affected["vendor"],
+                    affected["product"],
+                    affected["version"],
+                    affected["versionStartIncluding"],
+                    affected["versionStartExcluding"],
+                    affected["versionEndIncluding"],
+                    affected["versionEndExcluding"],
                 )
-            ]
+                for affected in affected_data
+            ],
         )
 
-    def load_curl_version(self, version):
-        """
-        Return the dict of CVE data for the given curl version.
-        """
-        filename = os.path.join(
-            self.cachedir, self.CURL_CVE_FILENAME_TEMPLATE.format(version)
-        )
-        # Check if file exists
-        if not os.path.isfile(filename):
-            with ErrorHandler(mode=self.error_mode, logger=self.LOGGER):
-                raise CVEDataForCurlVersionNotInCache(version)
-        # Open the file and load the JSON data, log the number of CVEs loaded
-        with open(filename, "rb") as fileobj:
-            cves_for_version = json.load(fileobj)
-            self.LOGGER.debug(
-                f"Curl Version {version} has {len(cves_for_version)} CVEs in dataset"
-            )
-            return cves_for_version
-
-    def curl_versions(self):
-        """
-        Return the versions we have Curl data for.
-        """
-        regex = re.compile(r"curlcve-(\d+.\d+.\d).json")
-        return [
-            regex.search(filename).group(1)
-            for filename in glob.glob(os.path.join(self.cachedir, "curlcve-*.json"))
-        ]
-
-    def clear_cached_data(self):
-        if os.path.exists(self.cachedir):
-            self.LOGGER.warning(f"Deleting cachedir {self.cachedir}")
+    def clear_cached_data(self) -> None:
+        self.create_cache_backup()
+        if self.cachedir.exists():
+            self.LOGGER.warning(f"Updating cachedir {self.cachedir}")
             shutil.rmtree(self.cachedir)
         # Remove files associated with pre-1.0 development tree
-        if os.path.exists(OLD_CACHE_DIR):
+        if OLD_CACHE_DIR.exists():
             self.LOGGER.warning(f"Deleting old cachedir {OLD_CACHE_DIR}")
             shutil.rmtree(OLD_CACHE_DIR)
 
-    def db_open(self):
-        """ Opens connection to sqlite database."""
+    def get_vendor_product_pairs(self, package_names) -> list[dict[str, str]]:
+        """
+        Fetches vendor from the database for packages that doesn't have vendor info for Package List Parser Utility and Universal Python package checker.
+        """
+        self.db_open()
+        cursor = self.connection.cursor()
+        vendor_package_pairs = []
+        query = """
+        SELECT DISTINCT vendor FROM cve_range
+        WHERE product=?
+        """
+
+        # For python package checkers we don't need the progress bar running
+        if type(package_names) != list:
+            cursor.execute(query, [package_names])
+            vendors = list(map(lambda x: x[0], cursor.fetchall()))
+
+            for vendor in vendors:
+                if vendor != "":
+                    vendor_package_pairs.append(
+                        {
+                            "vendor": vendor,
+                            "product": package_names,
+                        }
+                    )
+            if len(vendor_package_pairs) > 1:
+                self.LOGGER.debug(f"Multiple vendors found for {package_names}")
+                for entry in vendor_package_pairs:
+                    self.LOGGER.debug(f'{entry["product"]} - {entry["vendor"]}')
+        else:
+            for package_name in track(
+                package_names, description="Processing the given list...."
+            ):
+                cursor.execute(query, [package_name["name"].lower()])
+                vendors = list(map(lambda x: x[0], cursor.fetchall()))
+                for vendor in vendors:
+                    if vendor != "":
+                        vendor_package_pairs.append(
+                            {
+                                "vendor": vendor,
+                                "product": package_name["name"],
+                            }
+                        )
+        self.db_close()
+
+        return vendor_package_pairs
+
+    def update_vendors(self, cve_data):
+        """Get vendors for products and update CVE data."""
+        updated_severity = []
+        updated_affected = []
+
+        severity_data, affected_data = cve_data
+
+        self.db_open()
+
+        cursor = self.connection.cursor()
+
+        create_index = "CREATE INDEX IF NOT EXISTS product_vendor_index ON cve_range (product, vendor)"
+        drop_index = "DROP INDEX product_vendor_index"
+
+        query = """
+        SELECT DISTINCT vendor FROM cve_range
+        WHERE product=?
+        """
+
+        cursor.execute(create_index)
+
+        sel_cve = set()
+
+        for affected in affected_data:
+            cursor.execute(query, [affected["product"]])
+            vendors = list(map(lambda x: x[0], cursor.fetchall()))
+
+            if len(vendors) == 1:
+                affected["vendor"] = vendors[0]
+            else:
+                for vendor in vendors:
+                    if vendor == affected["vendor"]:
+                        updated_affected.append(affected)
+                        sel_cve.add(affected["cve_id"])
+                continue
+
+            updated_affected.append(affected)
+            sel_cve.add(affected["cve_id"])
+
+        for cve in severity_data:
+            if cve["ID"] in sel_cve:
+                updated_severity.append(cve)
+
+        cursor.execute(drop_index)
+
+        self.db_close()
+
+        return updated_severity, updated_affected
+
+    def filter_duplicate(self, cve_data, source):
+        """Filter out duplicate CVEs in CVE data."""
+        updated_severity = []
+        updated_affected = []
+
+        severity_data, affected_data = cve_data
+
+        self.db_open()
+
+        cursor = self.connection.cursor()
+
+        query = """
+        SELECT cve_number, data_source FROM cve_severity
+        WHERE cve_number=?
+        """
+
+        sel_cve = set()
+
+        for affected in affected_data:
+            cursor.execute(query, [affected["cve_id"]])
+            result = cursor.fetchall()
+            cve = list(map(lambda x: x[0], result))
+
+            if len(cve) == 0 or result[0][1] == source:
+                updated_affected.append(affected)
+                sel_cve.add(affected["cve_id"])
+
+        for cve in severity_data:
+            if cve["ID"] in sel_cve:
+                updated_severity.append(cve)
+
+        self.db_close()
+
+        return updated_severity, updated_affected
+
+    def db_open(self) -> None:
+        """Opens connection to sqlite database."""
         if not self.connection:
             self.connection = sqlite3.connect(self.dbpath)
 
-    def db_close(self):
-        """ Closes connection to sqlite database."""
+    def db_close(self) -> None:
+        """Closes connection to sqlite database."""
         if self.connection:
             self.connection.close()
             self.connection = None
+
+    def create_cache_backup(self) -> None:
+        """Creates a backup of the cachedir in case anything fails"""
+        if self.cachedir.exists():
+            self.LOGGER.debug(
+                f"Creating backup of cachedir {self.cachedir} at {self.backup_cachedir}"
+            )
+            self.remove_cache_backup()
+            shutil.copytree(self.cachedir, self.backup_cachedir)
+
+    def copy_db(self, filename, export=True):
+        self.db_close()
+        if export:
+            shutil.copy(self.dbpath, filename)
+        else:
+            shutil.copy(filename, self.dbpath)
+
+    def remove_cache_backup(self) -> None:
+        """Removes the backup if database was successfully loaded"""
+        if self.backup_cachedir.exists():
+            self.LOGGER.debug(f"Removing backup cache from {self.backup_cachedir}")
+            shutil.rmtree(self.backup_cachedir)
+
+    def rollback_cache_backup(self) -> None:
+        """Rollback the cachedir backup in case anything fails"""
+        if (self.backup_cachedir / DBNAME).exists():
+            self.LOGGER.info("Rolling back the cache to its previous state")
+            if self.cachedir.exists():
+                shutil.rmtree(self.cachedir)
+            shutil.move(self.backup_cachedir, self.cachedir)
+
+    def __del__(self) -> None:
+        self.rollback_cache_backup()
+
+    # Methods to check and update exploits
+
+    def update_exploits(self):
+        url = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+        r = requests.get(url)
+        data = r.json()
+        cves = data["vulnerabilities"]
+        exploit_list = []
+        for cve in cves:
+            exploit_list.append((cve["cveID"], cve["product"], cve["shortDescription"]))
+        self.populate_exploit_db(exploit_list)
+
+    def get_cache_exploits(self):
+        get_exploits = """
+        SELECT cve_number FROM cve_exploited
+        """
+        self.db_open()
+        cursor = self.connection.cursor()
+        cursor.row_factory = lambda cursor, row: row[0]
+        self.exploits_list = cursor.execute(get_exploits).fetchall()
+        self.db_close()
+        self.exploit_count = len(self.exploits_list)
+
+    def get_exploits_list(self):
+        return self.exploits_list
+
+    def get_exploits_count(self):
+        return self.exploit_count
+
+    def create_exploit_db(self):
+        create_exploit_table = """
+        CREATE TABLE IF NOT EXISTS cve_exploited (
+            cve_number TEXT,
+            product TEXT,
+            description TEXT,
+            PRIMARY KEY(cve_number)
+        )
+        """
+        self.db_open()
+        cursor = self.connection.cursor()
+        cursor.execute(create_exploit_table)
+        self.connection.commit()
+        self.db_close()
+
+    def populate_exploit_db(self, exploits):
+        insert_exploit = """
+        INSERT or REPLACE INTO cve_exploited (
+            cve_number,
+            product,
+            description
+        )
+        VALUES (?,?,?)
+        """
+        self.db_open()
+        cursor = self.connection.cursor()
+        cursor.executemany(insert_exploit, exploits)
+        self.connection.commit()
+        self.db_close()
 
     def get_cves(self, lcve_number):
 
@@ -637,7 +594,6 @@ class CVEDB:
                 cvedict[cve_res[0]] = {"publishdate": cve_res[1], "score": cve_res[2], "cvss_version": cve_res[3]}
 
         return cvedict
-
 
 def getOptions(args=None):
     if args is None:
