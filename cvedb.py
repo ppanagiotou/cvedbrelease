@@ -1,32 +1,36 @@
 # Copyright (C) 2022 Intel Corporation
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+# Copyright (C) 2022 Intel Corporation
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """
 Handling CVE database
 """
 from __future__ import annotations
 
-import argparse
-
-import sys
-
 import asyncio
 import datetime
+import json
 import logging
 import shutil
 import sqlite3
+from os import utime
 from pathlib import Path
 from typing import Any
-import json
 
 import requests
 from rich.progress import track
 
 from cve_bin_tool.async_utils import run_coroutine
-from data_sources import curl_source, nvd_source, osv_source
-from cve_bin_tool.error_handler import ErrorMode
+from cve_bin_tool.data_sources import curl_source, gad_source, nvd_source, osv_source
+from cve_bin_tool.error_handler import CVEDBError, ErrorMode
+from cve_bin_tool.fetch_json_db import Fetch_JSON_DB
 from cve_bin_tool.log import LOGGER
 from cve_bin_tool.version import check_latest_version
+
+import sys
+import argparse
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -35,6 +39,7 @@ DISK_LOCATION_DEFAULT = Path("~").expanduser() / ".cache" / "cvedbrelease"
 DISK_LOCATION_BACKUP = Path("~").expanduser() / ".cache" / "cvedbrelease-backup"
 DBNAME = "cve.db"
 OLD_CACHE_DIR = Path("~") / ".cache" / "cvedb"
+
 
 class CVEDB:
     """
@@ -45,21 +50,31 @@ class CVEDB:
     CACHEDIR = DISK_LOCATION_DEFAULT
     BACKUPCACHEDIR = DISK_LOCATION_BACKUP
     LOGGER = logging.getLogger("cvedb")
-    SOURCES = [nvd_source.NVD_Source, curl_source.Curl_Source, osv_source.OSV_Source]
+    SOURCES = [
+        nvd_source.NVD_Source,
+        curl_source.Curl_Source,
+        osv_source.OSV_Source,
+        gad_source.GAD_Source,
+    ]
 
     def __init__(
-        self,
-        sources=None,
-        cachedir: str | None = None,
-        backup_cachedir: str | None = None,
-        version_check: bool = True,
-        error_mode: ErrorMode = ErrorMode.TruncTrace,
+            self,
+            sources=None,
+            cachedir: str | None = None,
+            backup_cachedir: str | None = None,
+            version_check: bool = True,
+            error_mode: ErrorMode = ErrorMode.TruncTrace,
+            nvd_api_key: str = ""
     ):
+
         self.sources = (
             sources
             if sources is not None
             else [x(error_mode=error_mode) for x in self.SOURCES]
         )
+
+        self.sources[0].nvd_api_key = nvd_api_key
+
         self.cachedir = Path(cachedir) if cachedir is not None else self.CACHEDIR
         self.backup_cachedir = (
             Path(backup_cachedir)
@@ -130,8 +145,8 @@ class CVEDB:
         This avoids the full slow update with every execution.
         """
         if not self.dbpath.is_file() or (
-            datetime.datetime.today()
-            - datetime.datetime.fromtimestamp(self.dbpath.stat().st_mtime)
+                datetime.datetime.today()
+                - datetime.datetime.fromtimestamp(self.dbpath.stat().st_mtime)
         ) > datetime.timedelta(hours=24):
             self.refresh_cache_and_update_db()
             self.time_of_last_update = datetime.datetime.today()
@@ -377,7 +392,7 @@ class CVEDB:
                     self.LOGGER.debug(f'{entry["product"]} - {entry["vendor"]}')
         else:
             for package_name in track(
-                package_names, description="Processing the given list...."
+                    package_names, description="Processing the given list...."
             ):
                 cursor.execute(query, [package_name["name"].lower()])
                 vendors = list(map(lambda x: x[0], cursor.fetchall()))
@@ -595,27 +610,32 @@ class CVEDB:
 
         return cvedict
 
+
 def getOptions(args=None):
     if args is None:
         args = sys.argv[1:]
     parser = argparse.ArgumentParser(description="Parses command.")
-    parser.add_argument("-u", "--update", help="Update CVE database.", dest='update', action="store_true", default=False)
-    parser.add_argument("-s", "--search", help="Search for a CVE. Example: -s CVE-2018-0539 -s CVE-2018-0541", dest='cve_number', action='append')
+    parser.add_argument("-u", "--update", help="Update CVE database.", dest='update', action="store_true",
+                        default=False)
+    parser.add_argument("-s", "--search", help="Search for a CVE. Example: -s CVE-2018-0539 -s CVE-2018-0541",
+                        dest='cve_number', action='append')
+    parser.add_argument("--nvd-api-key", "--nvd-api-key", help="NVD API KEY", dest='nvd_api_key', default="")
     options = parser.parse_args(args)
     return options
+
 
 if __name__ == "__main__":
 
     # parse arguments
     options = getOptions()
 
-    cvedb = CVEDB()
+    cvedb = CVEDB(nvd_api_key=options.nvd_api_key)
 
     if options.update:
         cvedb.clear_cached_data()
         cvedb.refresh_cache_and_update_db()
 
-    if options.cve_number != None:
+    if options.cve_number is not None:
         resdict = cvedb.get_cves(options.cve_number)
         print(json.dumps(resdict))
     else:
