@@ -23,7 +23,7 @@ import requests
 from rich.progress import track
 
 from cve_bin_tool.async_utils import run_coroutine
-from data_sources import curl_source, gad_source, nvd_source, osv_source
+from data_sources import curl_source, gad_source, nvd_source, osv_source, redhat_source, rsd_source
 from cve_bin_tool.error_handler import CVEDBError, ErrorMode
 from cve_bin_tool.fetch_json_db import Fetch_JSON_DB
 from cve_bin_tool.log import LOGGER
@@ -55,6 +55,8 @@ class CVEDB:
         curl_source.Curl_Source,
         osv_source.OSV_Source,
         gad_source.GAD_Source,
+        redhat_source.REDHAT_Source,
+        rsd_source.RSD_Source,
     ]
 
     def __init__(
@@ -215,7 +217,7 @@ class CVEDB:
             cvss_vector TEXT,
             data_source TEXT,
             publishdate DATE,
-            PRIMARY KEY(cve_number)
+            PRIMARY KEY(cve_number, data_source)
         )
         """
         version_range_create = """
@@ -307,12 +309,21 @@ class CVEDB:
             if not bool(cve.get("description")):
                 LOGGER.debug(f"Update description for {cve['ID']} {data_source}")
                 cve["description"] = "unknown"
+
             if not bool(cve.get("score")):
                 LOGGER.debug(f"Update score for {cve['ID']} {data_source}")
-                cve["score"] = "unknown"
+                cve["score"] = None
+            else:
+                if str(cve.get("score")) == 'unknown':
+                    cve["score"] = None
+
             if not bool(cve.get("CVSS_version")):
                 LOGGER.debug(f"Update CVSS version for {cve['ID']} {data_source}")
-                cve["CVSS_version"] = "unknown"
+                cve["CVSS_version"] = None
+            else:
+                if str(cve.get("CVSS_version")) == 'unknown':
+                    cve["CVSS_version"] = None
+
             if not bool(cve.get("CVSS_vector")):
                 LOGGER.debug(f"Update CVSS Vector for {cve['ID']} {data_source}")
                 cve["CVSS_vector"] = "unknown"
@@ -322,24 +333,28 @@ class CVEDB:
                 logging.info(f"Update publishedDate for {cve['ID']} {data_source}")
                 cve["publishedDate"] = None
 
+        for cve in severity_data:
 
+            if str(cve.get("description")).__contains__("** REJECT **"):
+                logging.info(f"Do not add this CVE [** REJECT **] - {cve}")
+                continue
 
-        cursor.executemany(
-            insert_severity,
-            [
-                (
-                    cve["ID"],
-                    cve["severity"],
-                    cve["description"],
-                    cve["score"],
-                    cve["CVSS_version"],
-                    cve["CVSS_vector"],
-                    data_source,
-                    cve["publishedDate"],
+            try:
+                cursor.execute(
+                    insert_severity,
+                    [
+                        cve["ID"],
+                        cve["severity"].upper(),
+                        cve["description"],
+                        cve["score"],
+                        cve["CVSS_version"],
+                        cve["CVSS_vector"],
+                        data_source,
+                        cve["publishedDate"],
+                    ],
                 )
-                for cve in severity_data
-            ],
-        )
+            except Exception as e:
+                logging.error(f"Unable to insert data for {data_source} - {e}\n{cve}")
 
         # Delete any old range entries for this CVE_number
         cursor.executemany(del_cve_range, [(cve["ID"],) for cve in severity_data])
