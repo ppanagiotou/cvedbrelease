@@ -23,7 +23,7 @@ import requests
 from rich.progress import track
 
 from cve_bin_tool.async_utils import run_coroutine
-from cve_bin_tool.data_sources import curl_source, gad_source, nvd_source, osv_source
+from data_sources import curl_source, gad_source, nvd_source, osv_source
 from cve_bin_tool.error_handler import CVEDBError, ErrorMode
 from cve_bin_tool.fetch_json_db import Fetch_JSON_DB
 from cve_bin_tool.log import LOGGER
@@ -298,6 +298,31 @@ class CVEDB:
 
         insert_severity = f"INSERT or REPLACE INTO {cve_severity}"
         del_cve_range = "DELETE from cve_range where CVE_number=?"
+
+        for cve in severity_data:
+            # Check no None values
+            if not bool(cve.get("severity")):
+                LOGGER.debug(f"Update severity for {cve['ID']} {data_source}")
+                cve["severity"] = "unknown"
+            if not bool(cve.get("description")):
+                LOGGER.debug(f"Update description for {cve['ID']} {data_source}")
+                cve["description"] = "unknown"
+            if not bool(cve.get("score")):
+                LOGGER.debug(f"Update score for {cve['ID']} {data_source}")
+                cve["score"] = "unknown"
+            if not bool(cve.get("CVSS_version")):
+                LOGGER.debug(f"Update CVSS version for {cve['ID']} {data_source}")
+                cve["CVSS_version"] = "unknown"
+            if not bool(cve.get("CVSS_vector")):
+                LOGGER.debug(f"Update CVSS Vector for {cve['ID']} {data_source}")
+                cve["CVSS_vector"] = "unknown"
+
+            if not bool(cve.get("publishedDate")):
+                LOGGER.debug(f"Update publishedDate for {cve['ID']} {data_source}")
+                logging.info(f"Update publishedDate for {cve['ID']} {data_source}")
+                cve["publishedDate"] = None
+
+
 
         cursor.executemany(
             insert_severity,
